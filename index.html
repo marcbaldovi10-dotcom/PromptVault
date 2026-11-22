@@ -24,6 +24,8 @@
   </script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/3d-force-graph@1.73.3/dist/3d-force-graph.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     body { font-family: 'Inter', sans-serif; margin: 0; }
@@ -50,13 +52,15 @@
       activeView: 'all',
       selectedPromptId: null,
       mobileTab: 'list',
+      mainMode: 'editor',
       searchQuery: '',
       varValues: {},
       modal: null,
       aiInput: '',
       aiOutput: '',
       aiLoading: false,
-      aiError: ''
+      aiError: '',
+      inspectedNode: null
     };
 
     if (state.prompts.length > 0 && !state.selectedPromptId) {
@@ -92,26 +96,20 @@
       return [...new Set(matches.map(m => m.slice(2, -2).trim()).filter(Boolean))];
     }
 
-    function compilePrompt(prompt) {
+    function compilePromptOnly(prompt) {
       if (!prompt) return '';
-      let out = prompt.content;
-      getVariables(prompt.content).forEach(v => {
+      let out = prompt.content || '';
+      getVariables(out).forEach(v => {
         const val = state.varValues[v];
         if (val && val.trim()) {
           const safe = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           out = out.replace(new RegExp('\\{\\{\\s*' + safe + '\\s*\\}\\}', 'g'), val);
         }
       });
-      if (prompt.attachments && prompt.attachments.length > 0) {
-        const attTexts = prompt.attachments.map(a => `--- Attached File: ${a.name} ---\n${a.extractedText || '[No extracted text]'}`).join('\n\n');
-        if (attTexts) {
-          out += '\n\n' + attTexts;
-        }
-      }
       return out;
     }
 
-    async function copyText(text, label = 'Copied full prompt to clipboard') {
+    async function copyText(text, label = 'Copied prompt to clipboard') {
       try {
         await navigator.clipboard.writeText(text);
         notify(label);
@@ -124,6 +122,293 @@
         ta.remove();
         notify(label);
       }
+    }
+
+    function buildGraphData() {
+      const nodes = [];
+      const links = [];
+
+      const visibleFolders = (state.activeView === 'all' || state.activeView === 'favorites')
+        ? state.folders
+        : state.folders.filter(f => f.id === state.activeView);
+
+      visibleFolders.forEach(f => {
+        nodes.push({
+          id: f.id,
+          name: f.name,
+          type: 'folder',
+          radius: 14,
+          raw: f
+        });
+      });
+
+      const visiblePrompts = state.prompts.filter(p => {
+        if (state.activeView === 'favorites' && !p.favorite) return false;
+        if (state.activeView !== 'all' && state.activeView !== 'favorites' && p.folderId !== state.activeView) return false;
+        return true;
+      });
+
+      visiblePrompts.forEach(p => {
+        nodes.push({
+          id: p.id,
+          name: p.title || 'Untitled Prompt',
+          type: 'prompt',
+          radius: 11,
+          raw: p
+        });
+
+        if (visibleFolders.some(f => f.id === p.folderId)) {
+          links.push({ source: p.folderId, target: p.id });
+        }
+
+        (p.attachments || []).forEach(att => {
+          const isImg = att.isImage || (att.name && /\.(png|jpe?g|gif|webp|svg)$/i.test(att.name));
+          nodes.push({
+            id: att.id,
+            name: att.name,
+            type: isImg ? 'image' : 'file',
+            radius: 9,
+            raw: att,
+            parentPrompt: p
+          });
+          links.push({ source: p.id, target: att.id });
+        });
+      });
+
+      return { nodes, links };
+    }
+
+    // Generates a robust Canvas Texture wrapping text or rendering images onto the black sphere
+    function createBlackSphereTexture(node) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1024;
+      canvas.height = 512;
+      const ctx = canvas.getContext('2d');
+
+      // Deep solid black sphere background
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Clean bright border rim
+      ctx.strokeStyle = '#4F46E5';
+      ctx.lineWidth = 8;
+      ctx.strokeRect(4, 4, canvas.width - 8, canvas.height - 8);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+
+      if (node.type === 'image' && node.raw.dataUrl) {
+        const img = new Image();
+        img.onload = () => {
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.strokeStyle = '#EC4899';
+          ctx.lineWidth = 8;
+          ctx.strokeRect(4, 4, canvas.width - 8, canvas.height - 8);
+
+          const pad = 40;
+          const maxW = canvas.width - pad * 2;
+          const maxH = canvas.height - pad * 2;
+          const ratio = Math.min(maxW / img.width, maxH / img.height);
+          const w = img.width * ratio;
+          const h = img.height * ratio;
+          ctx.drawImage(img, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+          texture.needsUpdate = true;
+        };
+        img.src = node.raw.dataUrl;
+        return texture;
+      }
+
+      let category = '';
+      let titleText = '';
+      let bodyText = '';
+
+      if (node.type === 'folder') {
+        category = 'FOLDER';
+        titleText = node.name || 'Folder';
+        bodyText = 'Contains prompts & files';
+      } else if (node.type === 'prompt') {
+        category = 'PROMPT';
+        titleText = node.raw.title || 'Untitled Prompt';
+        bodyText = compilePromptOnly(node.raw) || '(Empty prompt content)';
+      } else {
+        category = node.type === 'image' ? 'IMAGE' : 'DOCUMENT / FILE';
+        titleText = node.name || 'Attached File';
+        bodyText = node.raw.extractedText || '(No text extracted from file)';
+      }
+
+      // Draw Category Badge
+      ctx.fillStyle = node.type === 'folder' ? '#10B981' : (node.type === 'prompt' ? '#6366F1' : '#F59E0B');
+      ctx.fillRect(40, 40, 220, 46);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 22px Inter, sans-serif';
+      ctx.fillText(category, 58, 71);
+
+      // Draw Title
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 36px Inter, sans-serif';
+      ctx.fillText(titleText.slice(0, 36), 40, 135);
+
+      // Divider line
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(40, 160);
+      ctx.lineTo(canvas.width - 40, 160);
+      ctx.stroke();
+
+      // Draw Body Text (Prompt text or File text)
+      ctx.fillStyle = '#E4E4E7';
+      ctx.font = '26px "JetBrains Mono", monospace';
+      const words = bodyText.replace(/\n+/g, ' ').split(' ');
+      let line = '';
+      let y = 210;
+      const maxWidth = canvas.width - 80;
+      const lineHeight = 38;
+
+      for (let i = 0; i < words.length; i++) {
+        const testLine = line + words[i] + ' ';
+        if (ctx.measureText(testLine).width > maxWidth && i > 0) {
+          ctx.fillText(line.trim(), 40, y);
+          line = words[i] + ' ';
+          y += lineHeight;
+          if (y > canvas.height - 50) {
+            ctx.fillText('...', 40, y);
+            break;
+          }
+        } else {
+          line = testLine;
+        }
+      }
+      if (y <= canvas.height - 50 && line.trim()) {
+        ctx.fillText(line.trim(), 40, y);
+      }
+
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    let graphInstance = null;
+
+    function init3DGraph() {
+      const container = document.getElementById('graph-3d-container');
+      if (!container || !window.ForceGraph3D || !window.THREE) return;
+
+      const data = buildGraphData();
+      const d = state.darkMode;
+
+      container.innerHTML = '';
+      graphInstance = ForceGraph3D()(container)
+        .width(container.clientWidth)
+        .height(container.clientHeight)
+        .backgroundColor(d ? '#0B0C0E' : '#E4E4E7')
+        .graphData(data)
+        .nodeLabel(node => `${node.type.toUpperCase()}: ${node.name}`)
+        .nodeThreeObject(node => {
+          const geometry = new THREE.SphereGeometry(node.radius, 32, 32);
+          const texture = createBlackSphereTexture(node);
+          const material = new THREE.MeshStandardMaterial({
+            map: texture,
+            roughness: 0.3,
+            metalness: 0.1
+          });
+          const mesh = new THREE.Mesh(geometry, material);
+          mesh.rotation.y = -Math.PI / 2;
+          return mesh;
+        })
+        .linkColor(() => d ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.35)')
+        .linkWidth(1.8)
+        .linkDirectionalParticles(2)
+        .linkDirectionalParticleWidth(1.8)
+        .onNodeClick(node => {
+          state.inspectedNode = node;
+          renderInspector();
+          const distance = 70;
+          const distRatio = 1 + distance / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
+          graphInstance.cameraPosition(
+            { x: (node.x || 0) * distRatio, y: (node.y || 0) * distRatio, z: (node.z || 0) * distRatio },
+            node,
+            800
+          );
+        });
+
+      const scene = graphInstance.scene();
+      const ambientLight = new THREE.AmbientLight(0xffffff, 1.8);
+      scene.add(ambientLight);
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+      dirLight.position.set(100, 100, 100);
+      scene.add(dirLight);
+    }
+
+    function renderInspector() {
+      const box = document.getElementById('node-inspector');
+      if (!box) return;
+      const node = state.inspectedNode;
+      const d = state.darkMode;
+      if (!node) {
+        box.innerHTML = `
+          <div class="text-xs text-zinc-500">
+            Click any black 3D sphere to inspect or copy its prompt text, file content, or image.
+          </div>`;
+        return;
+      }
+
+      let bodyHtml = '';
+      if (node.type === 'folder') {
+        const count = state.prompts.filter(p => p.folderId === node.id).length;
+        bodyHtml = `<p class="text-xs text-zinc-400">Folder containing <strong>${count}</strong> prompt(s).</p>`;
+      } else if (node.type === 'prompt') {
+        bodyHtml = `
+          <div class="space-y-2.5">
+            <pre class="p-2.5 rounded-lg border font-mono text-[11px] max-h-48 overflow-y-auto whitespace-pre-wrap ${d ? 'bg-[#16181D] border-[#242731] text-zinc-200' : 'bg-zinc-50 border-zinc-300 text-zinc-800'}">${esc(compilePromptOnly(node.raw) || 'Empty prompt')}</pre>
+            <div class="flex gap-2">
+              <button id="insp-copy-prompt" class="flex-1 py-1.5 px-2.5 rounded-lg bg-[#5E6AD2] text-white text-xs font-medium">Copy prompt</button>
+              <button id="insp-open-editor" class="py-1.5 px-2.5 rounded-lg border text-xs ${d ? 'border-[#242731] text-zinc-300' : 'border-zinc-300 text-zinc-700'}">Edit</button>
+            </div>
+          </div>`;
+      } else if (node.type === 'image') {
+        bodyHtml = `
+          <div class="space-y-2.5">
+            ${node.raw.dataUrl ? `<img src="${node.raw.dataUrl}" class="w-full max-h-48 object-contain rounded-lg border ${d ? 'border-[#242731]' : 'border-zinc-300'}" />` : '<p class="text-xs text-zinc-400">Image preview unavailable.</p>'}
+            <p class="text-[11px] text-zinc-400">Linked to: <strong>${esc(node.parentPrompt?.title || '')}</strong></p>
+          </div>`;
+      } else {
+        bodyHtml = `
+          <div class="space-y-2.5">
+            <pre class="p-2.5 rounded-lg border font-mono text-[11px] max-h-48 overflow-y-auto whitespace-pre-wrap ${d ? 'bg-[#16181D] border-[#242731] text-zinc-200' : 'bg-zinc-50 border-zinc-300 text-zinc-800'}">${esc(node.raw.extractedText || 'No text content')}</pre>
+            <button id="insp-copy-file" class="w-full py-1.5 px-2.5 rounded-lg bg-[#5E6AD2] text-white text-xs font-medium">Copy file text</button>
+          </div>`;
+      }
+
+      box.innerHTML = `
+        <div class="space-y-2.5">
+          <div class="flex items-center justify-between gap-2">
+            <span class="inline-flex items-center gap-1.5 text-xs font-semibold">
+              <span class="w-2.5 h-2.5 rounded-full bg-black border border-zinc-500"></span>
+              ${esc(node.name)}
+            </span>
+            <button id="insp-close" class="text-xs text-zinc-400 hover:text-zinc-200">✕</button>
+          </div>
+          ${bodyHtml}
+        </div>`;
+
+      const closeBtn = document.getElementById('insp-close');
+      if (closeBtn) closeBtn.onclick = () => { state.inspectedNode = null; renderInspector(); };
+
+      const copyP = document.getElementById('insp-copy-prompt');
+      if (copyP) copyP.onclick = () => copyText(compilePromptOnly(node.raw), 'Prompt copied');
+
+      const openEd = document.getElementById('insp-open-editor');
+      if (openEd) openEd.onclick = () => {
+        state.selectedPromptId = node.raw.id;
+        state.mainMode = 'editor';
+        state.mobileTab = 'editor';
+        render();
+      };
+
+      const copyF = document.getElementById('insp-copy-file');
+      if (copyF) copyF.onclick = () => copyText(node.raw.extractedText || '', 'File text copied');
     }
 
     function render() {
@@ -175,7 +460,7 @@
 
       const active = getActivePrompt();
       const vars = active ? getVariables(active.content) : [];
-      const compiled = compilePrompt(active);
+      const compiledOnly = compilePromptOnly(active);
 
       app.innerHTML = `
         <div class="h-screen w-screen flex flex-col md:flex-row overflow-hidden ${d ? 'bg-[#0B0C0E] text-zinc-100' : 'bg-[#F4F4F5] text-zinc-900'}">
@@ -185,9 +470,10 @@
               <button id="btn-mob-menu" class="p-1.5 rounded-lg border ${d ? 'border-[#242731] text-zinc-300' : 'border-zinc-300 text-zinc-700'}">
                 <i data-lucide="menu" class="w-4 h-4"></i>
               </button>
-              <span class="font-semibold text-sm truncate max-w-[150px]">${esc(state.user.name)}</span>
+              <span class="font-semibold text-sm truncate max-w-[130px]">${esc(state.user.name)}</span>
             </div>
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-1.5">
+              <button id="btn-mob-graph" class="px-2.5 py-1.5 rounded-lg border text-xs font-medium ${state.mainMode === 'graph' ? 'bg-[#5E6AD2] text-white border-[#5E6AD2]' : (d ? 'border-[#242731] text-zinc-300' : 'border-zinc-300 text-zinc-700')}">3D</button>
               <button id="btn-mob-ai" class="px-2.5 py-1.5 rounded-lg bg-[#5E6AD2] text-white text-xs font-medium">AI</button>
               <button id="btn-mob-new" class="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-medium">+ New</button>
             </div>
@@ -208,6 +494,17 @@
                 </button>
                 <button id="btn-close-sidebar" class="md:hidden p-1.5 rounded-lg text-zinc-600 dark:text-zinc-300">
                   <i data-lucide="x" class="w-4 h-4"></i>
+                </button>
+              </div>
+            </div>
+
+            <div class="p-2.5 border-b ${d ? 'border-[#242731]' : 'border-zinc-300'}">
+              <div class="grid grid-cols-2 gap-1 p-1 rounded-lg ${d ? 'bg-[#16181D]' : 'bg-zinc-300/60'}">
+                <button id="mode-editor" class="py-1.5 rounded-md text-xs font-medium transition ${state.mainMode === 'editor' ? 'bg-[#5E6AD2] text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}">
+                  Editor
+                </button>
+                <button id="mode-graph" class="py-1.5 rounded-md text-xs font-medium transition flex items-center justify-center gap-1 ${state.mainMode === 'graph' ? 'bg-[#5E6AD2] text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}">
+                  <i data-lucide="orbit" class="w-3.5 h-3.5"></i> 3D Graph
                 </button>
               </div>
             </div>
@@ -253,103 +550,118 @@
             </div>
           </aside>
 
-          <section class="${state.mobileTab === 'list' ? 'flex' : 'hidden'} md:flex w-full md:w-80 flex-col border-r shrink-0 flex-1 md:flex-initial overflow-hidden ${d ? 'bg-[#0B0C0E] border-[#242731]' : 'bg-white border-zinc-300'}">
-            <div class="p-3 border-b ${d ? 'border-[#242731]' : 'border-zinc-300'} flex items-center justify-between gap-2">
-              <input id="search-input" type="text" value="${esc(state.searchQuery)}" placeholder="Search prompts..." class="w-full px-3 py-1.5 rounded-lg border text-xs outline-none ${d ? 'bg-[#16181D] border-[#242731] text-zinc-100 placeholder-zinc-600' : 'bg-zinc-100 border-zinc-300 text-zinc-900 placeholder-zinc-400'}" />
-              <button id="btn-new-prompt" class="hidden md:flex px-3 py-1.5 rounded-lg bg-[#5E6AD2] text-white text-xs font-medium shrink-0">+ New</button>
-            </div>
-            <div class="flex-1 overflow-y-auto p-2.5 space-y-2">
-              ${filtered.length === 0 ? `
-                <div class="text-center py-16 px-4 text-zinc-500 text-xs">
-                  No prompts yet.<br>Create your first prompt using the button above.
-                </div>
-              ` : filtered.map(p => `
-                <div data-pid="${p.id}" class="prompt-card p-3 rounded-xl border cursor-pointer transition ${p.id === state.selectedPromptId ? 'border-[#5E6AD2] bg-[#5E6AD2]/10 shadow-sm' : (d ? 'border-[#242731] bg-[#101114] hover:bg-zinc-900' : 'border-zinc-200 bg-zinc-50 hover:bg-zinc-100')}">
-                  <div class="flex items-center justify-between gap-2 mb-1">
-                    <h3 class="text-xs font-semibold truncate ${d ? 'text-zinc-100' : 'text-zinc-900'}">${esc(p.title || 'Untitled')}</h3>
-                    <button data-fav="${p.id}" class="btn-fav text-xs ${p.favorite ? 'text-amber-400' : 'text-zinc-400 hover:text-zinc-600'}">★</button>
-                  </div>
-                  <p class="text-[11px] text-zinc-500 line-clamp-2">${esc(p.content || 'Empty prompt...')}</p>
-                </div>
-              `).join('')}
-            </div>
-          </section>
-
-          <main class="${state.mobileTab === 'editor' ? 'flex' : 'hidden'} md:flex flex-1 flex-col min-w-0 overflow-hidden ${d ? 'bg-[#0B0C0E]' : 'bg-[#FAFAFA]'}">
-            ${active ? `
-              <div class="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-2 ${d ? 'border-[#242731]' : 'border-zinc-300'}">
-                <div class="flex items-center gap-2">
-                  <button id="btn-back-list" class="md:hidden px-2.5 py-1.5 rounded-lg border text-xs ${d ? 'border-[#242731] text-zinc-300' : 'border-zinc-300 text-zinc-700'}">← Back</button>
-                  <select id="edit-folder" class="px-2.5 py-1.5 rounded-lg border text-xs outline-none ${d ? 'bg-[#16181D] border-[#242731] text-zinc-100' : 'bg-white border-zinc-300 text-zinc-900'}">
-                    ${state.folders.map(f => `<option value="${f.id}" ${f.id === active.folderId ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}
-                  </select>
-                </div>
-                <div class="flex items-center gap-2">
-                  <button id="btn-copy-final" class="px-3 py-1.5 rounded-lg bg-[#5E6AD2] hover:bg-[#6E79E0] text-white text-xs font-medium flex items-center gap-1.5 shadow-sm transition">
-                    <i data-lucide="copy" class="w-3.5 h-3.5"></i> Copy prompt (with files & text)
-                  </button>
-                  <button id="btn-delete-prompt" class="px-2.5 py-1.5 rounded-lg text-red-500 hover:bg-red-500/10 text-xs transition">Delete</button>
-                </div>
+          ${state.mainMode === 'graph' ? `
+            <main class="flex-1 relative flex flex-col overflow-hidden ${d ? 'bg-[#0B0C0E]' : 'bg-[#E4E4E7]'}">
+              <div id="graph-3d-container" class="w-full h-full"></div>
+              
+              <div class="absolute top-4 left-4 z-10 p-3 rounded-xl border backdrop-blur-md space-y-1 ${d ? 'bg-[#101114]/85 border-[#242731]' : 'bg-white/90 border-zinc-300 shadow-sm'}">
+                <div class="text-xs font-semibold">3D Black Sphere Vault</div>
+                <div class="text-[11px] text-zinc-500">Each black sphere displays prompt text, file content, or images directly on its surface.</div>
               </div>
 
-              <div class="flex-1 overflow-y-auto p-4 md:p-7 space-y-5">
-                <input id="edit-title" type="text" value="${esc(active.title)}" placeholder="Prompt title..." class="w-full text-lg md:text-2xl font-bold bg-transparent outline-none ${d ? 'text-zinc-100 placeholder-zinc-600' : 'text-zinc-900 placeholder-zinc-400'}" />
+              <div id="node-inspector" class="absolute bottom-4 left-4 right-4 md:left-auto md:right-4 md:w-80 z-10 p-3.5 rounded-xl border backdrop-blur-md ${d ? 'bg-[#101114]/90 border-[#242731]' : 'bg-white/95 border-zinc-300 shadow-lg'}">
+                <div class="text-xs text-zinc-500">Click any black 3D sphere to inspect or copy its prompt text, file content, or image.</div>
+              </div>
+            </main>
+          ` : `
+            <section class="${state.mobileTab === 'list' ? 'flex' : 'hidden'} md:flex w-full md:w-80 flex-col border-r shrink-0 flex-1 md:flex-initial overflow-hidden ${d ? 'bg-[#0B0C0E] border-[#242731]' : 'bg-white border-zinc-300'}">
+              <div class="p-3 border-b ${d ? 'border-[#242731]' : 'border-zinc-300'} flex items-center justify-between gap-2">
+                <input id="search-input" type="text" value="${esc(state.searchQuery)}" placeholder="Search prompts..." class="w-full px-3 py-1.5 rounded-lg border text-xs outline-none ${d ? 'bg-[#16181D] border-[#242731] text-zinc-100 placeholder-zinc-600' : 'bg-zinc-100 border-zinc-300 text-zinc-900 placeholder-zinc-400'}" />
+                <button id="btn-new-prompt" class="hidden md:flex px-3 py-1.5 rounded-lg bg-[#5E6AD2] text-white text-xs font-medium shrink-0">+ New</button>
+              </div>
+              <div class="flex-1 overflow-y-auto p-2.5 space-y-2">
+                ${filtered.length === 0 ? `
+                  <div class="text-center py-16 px-4 text-zinc-500 text-xs">
+                    No prompts yet.<br>Create your first prompt using the button above.
+                  </div>
+                ` : filtered.map(p => `
+                  <div data-pid="${p.id}" class="prompt-card p-3 rounded-xl border cursor-pointer transition ${p.id === state.selectedPromptId ? 'border-[#5E6AD2] bg-[#5E6AD2]/10 shadow-sm' : (d ? 'border-[#242731] bg-[#101114] hover:bg-zinc-900' : 'border-zinc-200 bg-zinc-50 hover:bg-zinc-100')}">
+                    <div class="flex items-center justify-between gap-2 mb-1">
+                      <h3 class="text-xs font-semibold truncate ${d ? 'text-zinc-100' : 'text-zinc-900'}">${esc(p.title || 'Untitled')}</h3>
+                      <button data-fav="${p.id}" class="btn-fav text-xs ${p.favorite ? 'text-amber-400' : 'text-zinc-400 hover:text-zinc-600'}">★</button>
+                    </div>
+                    <p class="text-[11px] text-zinc-500 line-clamp-2">${esc(p.content || 'Empty prompt...')}</p>
+                  </div>
+                `).join('')}
+              </div>
+            </section>
 
-                ${vars.length > 0 ? `
+            <main class="${state.mobileTab === 'editor' ? 'flex' : 'hidden'} md:flex flex-1 flex-col min-w-0 overflow-hidden ${d ? 'bg-[#0B0C0E]' : 'bg-[#FAFAFA]'}">
+              ${active ? `
+                <div class="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-2 ${d ? 'border-[#242731]' : 'border-zinc-300'}">
+                  <div class="flex items-center gap-2">
+                    <button id="btn-back-list" class="md:hidden px-2.5 py-1.5 rounded-lg border text-xs ${d ? 'border-[#242731] text-zinc-300' : 'border-zinc-300 text-zinc-700'}">← Back</button>
+                    <select id="edit-folder" class="px-2.5 py-1.5 rounded-lg border text-xs outline-none ${d ? 'bg-[#16181D] border-[#242731] text-zinc-100' : 'bg-white border-zinc-300 text-zinc-900'}">
+                      ${state.folders.map(f => `<option value="${f.id}" ${f.id === active.folderId ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <button id="btn-copy-final" class="px-3 py-1.5 rounded-lg bg-[#5E6AD2] hover:bg-[#6E79E0] text-white text-xs font-medium flex items-center gap-1.5 shadow-sm transition">
+                      <i data-lucide="copy" class="w-3.5 h-3.5"></i> Copy prompt
+                    </button>
+                    <button id="btn-delete-prompt" class="px-2.5 py-1.5 rounded-lg text-red-500 hover:bg-red-500/10 text-xs transition">Delete</button>
+                  </div>
+                </div>
+
+                <div class="flex-1 overflow-y-auto p-4 md:p-7 space-y-5">
+                  <input id="edit-title" type="text" value="${esc(active.title)}" placeholder="Prompt title..." class="w-full text-lg md:text-2xl font-bold bg-transparent outline-none ${d ? 'text-zinc-100 placeholder-zinc-600' : 'text-zinc-900 placeholder-zinc-400'}" />
+
+                  ${vars.length > 0 ? `
+                    <div class="p-4 rounded-xl border ${d ? 'bg-[#101114] border-[#242731]' : 'bg-white border-zinc-300 shadow-sm'}">
+                      <div class="text-xs font-semibold text-[#5E6AD2] mb-2.5">Detected Variables (${vars.length})</div>
+                      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        ${vars.map(v => `
+                          <div>
+                            <label class="block text-[11px] font-mono text-zinc-400 mb-1">{{${esc(v)}}}</label>
+                            <input data-var="${esc(v)}" type="text" value="${esc(state.varValues[v] || '')}" placeholder="Value..." class="var-input w-full px-2.5 py-1.5 rounded-lg border text-xs outline-none ${d ? 'bg-[#16181D] border-[#242731] text-zinc-100 placeholder-zinc-600' : 'bg-zinc-50 border-zinc-300 text-zinc-900 placeholder-zinc-400'}" />
+                          </div>
+                        `).join('')}
+                      </div>
+                    </div>
+                  ` : ''}
+
+                  <div>
+                    <label class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5 font-medium">Prompt Content (write freely and use {{variable}} if desired)</label>
+                    <textarea id="edit-content" rows="10" placeholder="Type your prompt here..." class="w-full p-3.5 rounded-xl border font-mono text-xs leading-relaxed outline-none shadow-inner ${d ? 'bg-[#101114] border-[#242731] text-zinc-100 placeholder-zinc-600' : 'bg-white border-zinc-300 text-zinc-900 placeholder-zinc-400'}">${esc(active.content)}</textarea>
+                  </div>
+
+                  ${vars.length > 0 ? `
+                    <div>
+                      <label class="block text-[11px] uppercase tracking-wider text-[#5E6AD2] mb-1.5 font-medium">Compiled Prompt Preview (only prompt text is copied)</label>
+                      <pre id="compiled-preview" class="p-3.5 rounded-xl border font-mono text-xs whitespace-pre-wrap ${d ? 'bg-[#16181D] border-[#242731] text-zinc-200' : 'bg-white border-zinc-300 text-zinc-800 shadow-sm'}">${esc(compiledOnly)}</pre>
+                    </div>
+                  ` : ''}
+
                   <div class="p-4 rounded-xl border ${d ? 'bg-[#101114] border-[#242731]' : 'bg-white border-zinc-300 shadow-sm'}">
-                    <div class="text-xs font-semibold text-[#5E6AD2] mb-2.5">Detected Variables (${vars.length})</div>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      ${vars.map(v => `
-                        <div>
-                          <label class="block text-[11px] font-mono text-zinc-400 mb-1">{{${esc(v)}}}</label>
-                          <input data-var="${esc(v)}" type="text" value="${esc(state.varValues[v] || '')}" placeholder="Value..." class="var-input w-full px-2.5 py-1.5 rounded-lg border text-xs outline-none ${d ? 'bg-[#16181D] border-[#242731] text-zinc-100 placeholder-zinc-600' : 'bg-zinc-50 border-zinc-300 text-zinc-900 placeholder-zinc-400'}" />
+                    <div class="flex items-center justify-between mb-3">
+                      <div>
+                        <span class="text-xs font-semibold block ${d ? 'text-zinc-200' : 'text-zinc-800'}">Reference Files & Images (TXT, PDF, Images)</span>
+                        <span class="text-[10px] text-zinc-500">Displayed on linked black 3D spheres in the 3D Graph view.</span>
+                      </div>
+                      <label class="px-3 py-1.5 rounded-lg bg-[#5E6AD2]/15 text-[#5E6AD2] text-xs font-medium cursor-pointer shrink-0 hover:bg-[#5E6AD2]/25 transition">
+                        + Attach File
+                        <input id="file-upload" type="file" multiple accept=".pdf,.txt,.md,.csv,image/*" class="hidden" />
+                      </label>
+                    </div>
+                    <div class="space-y-2">
+                      ${(active.attachments || []).map(a => `
+                        <div class="p-2.5 rounded-lg border flex items-center justify-between gap-2 ${d ? 'bg-[#16181D] border-[#242731]' : 'bg-zinc-50 border-zinc-300'}">
+                          <div class="flex items-center gap-2 truncate">
+                            <i data-lucide="${a.isImage ? 'image' : 'file-text'}" class="w-3.5 h-3.5 text-[#5E6AD2] shrink-0"></i>
+                            <span class="text-xs truncate ${d ? 'text-zinc-200' : 'text-zinc-800'}">${esc(a.name)}</span>
+                          </div>
+                          <div class="flex items-center gap-2 shrink-0">
+                            ${a.extractedText && !a.isImage ? `<button data-copy-att="${a.id}" class="btn-copy-att text-[11px] text-[#5E6AD2] hover:underline">Copy file text</button>` : ''}
+                            <button data-del-att="${a.id}" class="btn-del-att text-xs text-red-500 hover:text-red-700 font-bold px-1" title="Delete file">✕</button>
+                          </div>
                         </div>
                       `).join('')}
                     </div>
                   </div>
-                ` : ''}
-
-                <div>
-                  <label class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5 font-medium">Prompt Content (write freely and use {{variable}} if desired)</label>
-                  <textarea id="edit-content" rows="10" placeholder="Type your prompt here..." class="w-full p-3.5 rounded-xl border font-mono text-xs leading-relaxed outline-none shadow-inner ${d ? 'bg-[#101114] border-[#242731] text-zinc-100 placeholder-zinc-600' : 'bg-white border-zinc-300 text-zinc-900 placeholder-zinc-400'}">${esc(active.content)}</textarea>
                 </div>
-
-                ${(vars.length > 0 || (active.attachments && active.attachments.length > 0)) ? `
-                  <div>
-                    <label class="block text-[11px] uppercase tracking-wider text-[#5E6AD2] mb-1.5 font-medium">Final Preview (everything will be copied to clipboard)</label>
-                    <pre id="compiled-preview" class="p-3.5 rounded-xl border font-mono text-xs whitespace-pre-wrap ${d ? 'bg-[#16181D] border-[#242731] text-zinc-200' : 'bg-white border-zinc-300 text-zinc-800 shadow-sm'}">${esc(compiled)}</pre>
-                  </div>
-                ` : ''}
-
-                <div class="p-4 rounded-xl border ${d ? 'bg-[#101114] border-[#242731]' : 'bg-white border-zinc-300 shadow-sm'}">
-                  <div class="flex items-center justify-between mb-3">
-                    <div>
-                      <span class="text-xs font-semibold block ${d ? 'text-zinc-200' : 'text-zinc-800'}">Reference Files (TXT, PDF, Images)</span>
-                      <span class="text-[10px] text-zinc-500">Attached files will be fully included when copying the prompt.</span>
-                    </div>
-                    <label class="px-3 py-1.5 rounded-lg bg-[#5E6AD2]/15 text-[#5E6AD2] text-xs font-medium cursor-pointer shrink-0 hover:bg-[#5E6AD2]/25 transition">
-                      + Attach File
-                      <input id="file-upload" type="file" multiple accept=".pdf,.txt,.md,.csv,image/*" class="hidden" />
-                    </label>
-                  </div>
-                  <div class="space-y-2">
-                    ${(active.attachments || []).map(a => `
-                      <div class="p-2.5 rounded-lg border flex items-center justify-between gap-2 ${d ? 'bg-[#16181D] border-[#242731]' : 'bg-zinc-50 border-zinc-300'}">
-                        <div class="flex items-center gap-2 truncate">
-                          <i data-lucide="file-text" class="w-3.5 h-3.5 text-[#5E6AD2] shrink-0"></i>
-                          <span class="text-xs truncate ${d ? 'text-zinc-200' : 'text-zinc-800'}">${esc(a.name)}</span>
-                        </div>
-                        <div class="flex items-center gap-2 shrink-0">
-                          ${a.extractedText ? `<button data-copy-att="${a.id}" class="btn-copy-att text-[11px] text-[#5E6AD2] hover:underline">Copy text</button>` : ''}
-                          <button data-del-att="${a.id}" class="btn-del-att text-xs text-red-500 hover:text-red-700 font-bold px-1" title="Delete file">✕</button>
-                        </div>
-                      </div>
-                    `).join('')}
-                  </div>
-                </div>
-              </div>
-            ` : '<div class="flex-1 flex items-center justify-center text-xs text-zinc-500">Create or select a prompt from the sidebar</div>'}
-          </main>
+              ` : '<div class="flex-1 flex items-center justify-center text-xs text-zinc-500">Create or select a prompt from the sidebar</div>'}
+            </main>
+          `}
         </div>
 
         ${state.modal === 'ai' ? `
@@ -429,6 +741,12 @@
 
       if (window.lucide) window.lucide.createIcons();
       bindEvents();
+      if (state.mainMode === 'graph') {
+        setTimeout(() => {
+          init3DGraph();
+          renderInspector();
+        }, 50);
+      }
     }
 
     function bindEvents() {
@@ -438,6 +756,14 @@
       on('btn-close-sidebar', 'onclick', () => { state.mobileTab = 'list'; render(); });
       on('btn-back-list', 'onclick', () => { state.mobileTab = 'list'; render(); });
       on('btn-theme', 'onclick', () => { state.darkMode = !state.darkMode; save(); render(); });
+
+      on('mode-editor', 'onclick', () => { state.mainMode = 'editor'; render(); });
+      on('mode-graph', 'onclick', () => { state.mainMode = 'graph'; state.inspectedNode = null; render(); });
+      on('btn-mob-graph', 'onclick', () => {
+        state.mainMode = state.mainMode === 'graph' ? 'editor' : 'graph';
+        state.inspectedNode = null;
+        render();
+      });
 
       const editVaultName = () => {
         const newName = prompt('Edit your Vault name:', state.user.name);
@@ -454,6 +780,7 @@
         el.onclick = () => {
           state.activeView = el.getAttribute('data-view');
           state.mobileTab = 'list';
+          state.inspectedNode = null;
           render();
         };
       });
@@ -480,6 +807,7 @@
         };
         state.prompts.unshift(p);
         state.selectedPromptId = p.id;
+        state.mainMode = 'editor';
         state.mobileTab = 'editor';
         save();
         render();
@@ -530,11 +858,11 @@
             const v = el.getAttribute('data-var');
             state.varValues[v] = e.target.value;
             const prev = document.getElementById('compiled-preview');
-            if (prev) prev.textContent = compilePrompt(active);
+            if (prev) prev.textContent = compilePromptOnly(active);
           };
         });
 
-        on('btn-copy-final', 'onclick', () => copyText(compilePrompt(active), 'Prompt and files copied to clipboard'));
+        on('btn-copy-final', 'onclick', () => copyText(compilePromptOnly(active), 'Prompt copied to clipboard'));
         on('btn-delete-prompt', 'onclick', () => {
           state.prompts = state.prompts.filter(x => x.id !== active.id);
           state.selectedPromptId = state.prompts[0]?.id || null;
@@ -555,24 +883,29 @@
                   const c = await page.getTextContent();
                   txt += c.items.map(it => it.str).join(' ') + '\n';
                 }
-                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, extractedText: txt.trim() });
+                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, isImage: false, extractedText: txt.trim() });
               } catch {
-                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, extractedText: '[Attached PDF: ' + file.name + ']' });
+                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, isImage: false, extractedText: '[Attached PDF: ' + file.name + ']' });
               }
             } else if (file.type.startsWith('image/')) {
-              active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, extractedText: '[Attached Image: ' + file.name + ']' });
+              const dataUrl = await new Promise(res => {
+                const reader = new FileReader();
+                reader.onload = () => res(reader.result);
+                reader.readAsDataURL(file);
+              });
+              active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, isImage: true, dataUrl, extractedText: '' });
             } else {
               try {
                 const txt = await file.text();
-                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, extractedText: txt });
+                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, isImage: false, extractedText: txt });
               } catch {
-                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, extractedText: '[Attached file: ' + file.name + ']' });
+                active.attachments.push({ id: 'a-' + Date.now() + Math.random(), name: file.name, isImage: false, extractedText: '[Attached file: ' + file.name + ']' });
               }
             }
           }
           save();
           render();
-          notify('Files read and attached successfully');
+          notify('Files attached');
         });
 
         document.querySelectorAll('.btn-copy-att').forEach(el => {
@@ -671,6 +1004,7 @@
         state.prompts.unshift(p);
         state.selectedPromptId = p.id;
         state.modal = null;
+        state.mainMode = 'editor';
         state.mobileTab = 'editor';
         save();
         render();
@@ -711,6 +1045,15 @@
         }
       });
     }
+
+    window.addEventListener('resize', () => {
+      if (state.mainMode === 'graph' && graphInstance) {
+        const container = document.getElementById('graph-3d-container');
+        if (container) {
+          graphInstance.width(container.clientWidth).height(container.clientHeight);
+        }
+      }
+    });
 
     render();
   </script>
